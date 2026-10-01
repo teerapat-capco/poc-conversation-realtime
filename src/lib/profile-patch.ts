@@ -134,3 +134,15 @@ export function classifyProfilePatch(raw: string) {
 
   return { success: true as const, accepted, skipped };
 }
+
+export function partitionManualOwnedUpdates(
+  updates: ProfileUpdate[],
+  manualFields: ReadonlySet<ProfileField>,
+) {
+  const accepted: ProfileUpdate[] = [];
+  const manuallyOwned: ProfileUpdate[] = [];
+  for (const update of updates) {
+    (manualFields.has(update.field) ? manuallyOwned : accepted).push(update);
+  }
+  return { accepted, manuallyOwned };
+}

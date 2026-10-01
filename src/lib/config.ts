@@ -1,26 +1,22 @@
 import { z } from "zod";
 
 const configSchema = z.object({
-  AZURE_OPENAI_ENDPOINT: z.string().trim().url().optional().or(z.literal("")),
-  AZURE_OPENAI_API_KEY: z.string().trim().optional(),
-  AZURE_REALTIME_DEPLOYMENT: z.string().trim().optional(),
-  AZURE_TRANSCRIPTION_DEPLOYMENT: z.string().trim().optional(),
+  FOUNDRY_PROJECT_ENDPOINT: z.string().trim().url().optional().or(z.literal("")),
+  FOUNDRY_VOICE_AGENT_NAME: z.string().trim().optional(),
 });
 
 const requiredNames = [
-  "AZURE_OPENAI_ENDPOINT",
-  "AZURE_OPENAI_API_KEY",
-  "AZURE_REALTIME_DEPLOYMENT",
-  "AZURE_TRANSCRIPTION_DEPLOYMENT",
+  "FOUNDRY_PROJECT_ENDPOINT",
+  "FOUNDRY_VOICE_AGENT_NAME",
 ] as const;
 
-export function getAzureConfigStatus() {
+export function getFoundryConfigStatus() {
   const parsed = configSchema.safeParse(process.env);
 
   if (!parsed.success) {
     return {
       configured: false,
-      missing: ["AZURE_OPENAI_ENDPOINT (must be a valid URL)"],
+      missing: ["FOUNDRY_PROJECT_ENDPOINT (must be a valid URL)"],
     };
   }
 
