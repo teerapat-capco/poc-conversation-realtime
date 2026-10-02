@@ -38,6 +38,18 @@ registerProcessor("pcm-capture-processor", PcmCaptureProcessor);
 
 export type PcmCapture = { stop: () => Promise<void> };
 
+function addSilentReferenceChannel(monoBuffer: ArrayBuffer): ArrayBuffer {
+  const mono = new Int16Array(monoBuffer);
+  const stereo = new Int16Array(mono.length * 2);
+
+  for (let i = 0; i < mono.length; i++) {
+    stereo[i * 2] = mono[i];       // channel 0: microphone
+    stereo[i * 2 + 1] = 0;        // channel 1: playback reference
+  }
+
+  return stereo.buffer;
+}
+
 export async function createPcmCapture(
   stream: MediaStream,
   socket: WebSocket,
@@ -76,7 +88,9 @@ export async function createPcmCapture(
       onError(new Error("Audio bridge is not keeping up with microphone input."));
       return;
     }
-    socket.send(event.data.buffer);
+    // socket.send(event.data.buffer);
+    const stereo = addSilentReferenceChannel(event.data.buffer);
+    socket.send(stereo);
   };
 
   return {

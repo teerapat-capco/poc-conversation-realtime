@@ -70,14 +70,48 @@ function createSessionHandler(socket) {
   let started = false;
   let shuttingDown = false;
 
+  // diagnostic only
+  let diagnosticCommitted = false;
+
+  // async function closeConnection() {
+  //   if (shuttingDown) return;
+  //   shuttingDown = true;
+  //   if (connection) await connection.close().catch(() => { });
+  //   if (eventPump) await Promise.race([
+  //     eventPump,
+  //     new Promise((resolve) => setTimeout(resolve, 1_000)),
+  //   ]);
+  // }
   async function closeConnection() {
     if (shuttingDown) return;
+
     shuttingDown = true;
-    if (connection) await connection.close().catch(() => { });
-    if (eventPump) await Promise.race([
-      eventPump,
-      new Promise((resolve) => setTimeout(resolve, 1_000)),
-    ]);
+
+    console.log("[bridge] closing Foundry connection");
+
+    if (connection) {
+      await connection.close().catch((error) => {
+        console.error(
+          "[bridge] Foundry close failed:",
+          error,
+        );
+      });
+
+      connection = null;
+    }
+
+    if (eventPump) {
+      await Promise.race([
+        eventPump,
+        new Promise((resolve) =>
+          setTimeout(resolve, 1_000)
+        ),
+      ]);
+
+      eventPump = null;
+    }
+
+    console.log("[bridge] Foundry connection closed");
   }
 
   async function start() {
@@ -117,56 +151,148 @@ function createSessionHandler(socket) {
         connectionTimeoutInMs: 30_000,
       });
 
-      stage = "session setup";
       eventPump = (async () => {
         for await (const event of connection) {
-          console.log("[bridge] event:", event.type);
-          if (socket.readyState !== WebSocket.OPEN) break;
-          if (event.type === "input_audio_buffer.committed") bufferedAudioBytes = 0;
-          const normalized = normalizeFoundryVoiceEvent(event);
-          if (normalized?.type === "error") {
-            console.error("[bridge] Foundry realtime error", JSON.stringify(normalized.error));
-          }
-          if (normalized) sendJson(socket, { type: "event", event: normalized });
+          console.log("[foundry]", event.type);
+
           if (event.type === "session.created") {
             console.log("[bridge] session.created");
-
-            console.log("[bridge] configuring realtime session");
-            // await connection.configureSession({
-            //   type: "realtime",
-            //   output_modalities: ["text"],
-            //   audio: {
-            //     input: {
-            //       format: { type: "audio/pcm", rate: 24_000 },
-            //       transcription: {
-            //         model: process.env.AZURE_TRANSCRIPTION_DEPLOYMENT?.trim()
-            //           || process.env.FOUNDRY_TRANSCRIPTION_MODEL?.trim()
-            //           || "azure-speech",
-            //       },
-            //       turn_detection: configuredTurnDetection,
-            //     },
-            //   },
-            // });
-            await connection.configureSession({
-              type: "realtime",
-              output_modalities: ["text", "audio"],
-              audio: {
-                output: {
-                  format: { type: "audio/pcm", rate: 24_000 },
-                },
-              },
-            });
-            console.log("[bridge] configureSession sent");
             sendJson(socket, { type: "bridge.ready" });
           }
+
+          // Agent audio -> Browser as binary WebSocket frame
+          if (event.type === "response.output_audio.delta") {
+            if (
+              socket.readyState === WebSocket.OPEN &&
+              event.delta &&
+              event.delta.byteLength > 0
+            ) {
+              socket.send(event.delta, { binary: true });
+            }
+            continue;
+          }
+
+          switch (event.type) {
+            case "input_audio_buffer.speech_started":
+            case "input_audio_buffer.speech_stopped":
+            case "input_audio_buffer.committed":
+            case "conversation.item.input_audio_transcription.delta":
+            case "conversation.item.input_audio_transcription.completed":
+            case "conversation.item.input_audio_transcription.failed":
+              console.dir(event, { depth: null });
+              break;
+          }
+
+          // Browser ต้องได้รับ events ด้วย
+          const normalized = normalizeFoundryVoiceEvent(event);
+          if (normalized) {
+            sendJson(socket, {
+              type: "event",
+              event: normalized,
+            });
+          }
         }
+
         if (socket.readyState === WebSocket.OPEN && !shuttingDown) {
           sendJson(socket, { type: "bridge.closed" });
         }
       })().catch((error) => {
-        sendFailure(socket, error, "Foundry realtime connection failed. Check local Azure access and bridge output.", stage);
+        sendFailure(
+          socket,
+          error,
+          "Foundry realtime connection failed.",
+          stage
+        );
         void closeConnection();
       });
+
+      stage = "session setup";
+      // eventPump = (async () => {
+      //   for await (const event of connection) {
+      //     console.log("[bridge] event:", event.type);
+      //     if (event.type === "unknown") {
+      //       console.log(
+      //         "[bridge] unknown event:",
+      //         event.eventType,
+      //         JSON.stringify(event.rawEvent)
+      //       );
+      //     }
+
+      //     if (
+      //       event.type === "response.output_text.delta" ||
+      //       event.type === "response.output_audio_transcript.delta"
+      //     ) {
+      //       console.log("[bridge] agent transcript:", event.delta);
+      //     }
+
+      //     if (event.type === "response.output_audio.delta") {
+      //       console.log(
+      //         "[bridge] agent audio:",
+      //         event.delta?.byteLength ?? event.delta?.length ?? "?"
+      //       );
+      //     }
+
+      //     if (event.type === "response.done") {
+      //       console.log("[bridge] response done");
+      //     }
+
+      //     if (socket.readyState !== WebSocket.OPEN) break;
+      //     if (event.type === "input_audio_buffer.committed") bufferedAudioBytes = 0;
+      //     const normalized = normalizeFoundryVoiceEvent(event);
+      //     if (normalized?.type === "error") {
+      //       console.error("[bridge] Foundry realtime error", JSON.stringify(normalized.error));
+      //     }
+      //     if (normalized) sendJson(socket, { type: "event", event: normalized });
+      //     if (event.type === "session.created") {
+      //       console.log("[bridge] session.created");
+
+      //       console.log("[bridge] configuring realtime session");
+      //       // await connection.configureSession({
+      //       //   type: "realtime",
+      //       //   output_modalities: ["text"],
+      //       //   audio: {
+      //       //     input: {
+      //       //       format: { type: "audio/pcm", rate: 24_000 },
+      //       //       transcription: {
+      //       //         model: process.env.AZURE_TRANSCRIPTION_DEPLOYMENT?.trim()
+      //       //           || process.env.FOUNDRY_TRANSCRIPTION_MODEL?.trim()
+      //       //           || "azure-speech",
+      //       //       },
+      //       //       turn_detection: configuredTurnDetection,
+      //       //     },
+      //       //   },
+      //       // });
+      //       // await connection.configureSession({
+      //       //   type: "realtime",
+      //       //   output_modalities: ["text", "audio"],
+      //       //   audio: {
+      //       //     output: {
+      //       //       format: { type: "audio/pcm", rate: 24_000 },
+      //       //     },
+      //       //   },
+      //       // });
+      //       sendJson(socket, { type: "bridge.ready" });
+
+      //       // setTimeout(async () => {
+      //       //   console.log("[bridge] sending text smoke test");
+      //       //   try {
+      //       //     await connection.sendText(
+      //       //       "Co-Sales กรุณาตอบสั้น ๆ ว่า เชื่อมต่อสำเร็จ"
+      //       //     );
+      //       //     console.log("[bridge] sendText completed");
+      //       //   } catch (error) {
+      //       //     console.error("[bridge] sendText failed", error);
+      //       //   }
+      //       // }, 1000);
+      //     }
+      //   }
+      //   if (socket.readyState === WebSocket.OPEN && !shuttingDown) {
+      //     sendJson(socket, { type: "bridge.closed" });
+      //   }
+      // })().catch((error) => {
+      //   sendFailure(socket, error, "Foundry realtime connection failed. Check local Azure access and bridge output.", stage);
+      //   void closeConnection();
+      // });
     } catch (error) {
       sendFailure(socket, error, "Foundry voice session could not start. Check the endpoint, agent, and local Azure access.", stage);
       await closeConnection();
@@ -176,9 +302,32 @@ function createSessionHandler(socket) {
   async function handleMessage(data, isBinary) {
     if (isBinary) {
       if (!connection || shuttingDown) return;
-      const bytes = Buffer.isBuffer(data) ? data : Buffer.from(data);
-      await connection.sendAudio(bytes);
-      bufferedAudioBytes += bytes.byteLength;
+      // const bytes = Buffer.isBuffer(data) ? data : Buffer.from(data);
+      // console.log(
+      //   "[bridge] browser audio:",
+      //   bytes.byteLength,
+      //   "bytes",
+      //   "first:",
+      //   bytes.subarray(0, 12)
+      // );
+      // await connection.sendAudio(bytes);
+      // bufferedAudioBytes += bytes.byteLength;
+      // console.log(
+      //   "[bridge] total browser audio:",
+      //   bufferedAudioBytes,
+      //   "bytes"
+      // );
+
+      const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data);
+
+      // Important: give the Azure SDK a plain Uint8Array,
+      // not a Node.js Buffer.
+      const audio = Uint8Array.from(buffer);
+
+      await connection.sendAudio(audio);
+
+      bufferedAudioBytes += audio.byteLength;
+
       return;
     }
 
@@ -213,10 +362,22 @@ function createSessionHandler(socket) {
     }
   }
 
+
+
   socket.on("message", (data, isBinary) => {
     commandQueue = commandQueue
       .then(() => handleMessage(data, isBinary))
-      .catch((error) => sendFailure(socket, error, "A Foundry voice operation failed."));
+      .catch((error) => {
+        console.error("[bridge] COMMAND ERROR:", error);
+        console.error("[bridge] COMMAND ERROR stack:", error?.stack);
+
+        sendFailure(
+          socket,
+          error,
+          "A Foundry voice operation failed.",
+          "command"
+        );
+      });
   });
   socket.on("close", () => { void closeConnection(); });
   socket.on("error", () => { void closeConnection(); });

@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { createPcmCapture, type PcmCapture } from "@/lib/pcm-capture";
+// import { createPcmCapture, type PcmCapture } from "@/lib/pcm-capture";
 import { isExtractionResponse } from "@/lib/voice-protocol";
 import {
   initialProfile,
@@ -22,6 +22,14 @@ import {
   MAX_CONTEXT_ITEMS,
   settleExtractionItems,
 } from "@/lib/extraction";
+// import {
+//   createPcmPlayback,
+//   type PcmPlayback,
+// } from "@/lib/pcm-playback";
+import {
+  createRealtimeAudio,
+  type RealtimeAudio,
+} from "@/lib/realtime-audio";
 
 type ConfigStatus = { configured: boolean; missing: readonly string[] };
 type LogEntry = { id: number; time: string; message: string };
@@ -52,9 +60,10 @@ type ExtractionState = {
 };
 type RealtimeSession = {
   socket: WebSocket | null;
-  capture: PcmCapture | null;
+  audio: RealtimeAudio | null;
   stream: MediaStream | null;
   closed: boolean;
+  suppressPlayback: boolean;
   readyResolver: (() => void) | null;
   readyRejecter: ((error: Error) => void) | null;
   extraction: ExtractionState;
@@ -80,30 +89,125 @@ function getProfileFieldValue(profile: CustomerProfile, field: ProfileField) {
   }
 }
 
-function closeSession(session: RealtimeSession) {
-  if (session.closed) return;
+function closeSession(
+  session: RealtimeSession,
+) {
+  if (session.closed) {
+    return;
+  }
+
   session.closed = true;
-  session.readyRejecter?.(new Error("Session closed"));
+
+  session.readyRejecter?.(
+    new Error("Session closed"),
+  );
+
   session.readyResolver = null;
   session.readyRejecter = null;
-  if (session.extraction.scheduledTimer) clearTimeout(session.extraction.scheduledTimer);
+
+  if (session.extraction.scheduledTimer) {
+    clearTimeout(
+      session.extraction.scheduledTimer,
+    );
+  }
+
   session.extraction.scheduledTimer = null;
+
   if (session.extraction.active) {
-    clearTimeout(session.extraction.active.timer);
+    clearTimeout(
+      session.extraction.active.timer,
+    );
+
     session.extraction.active.resolve(false);
   }
+
   session.extraction.active = null;
-  if (session.audioFlushTimer) clearTimeout(session.audioFlushTimer);
+
+  if (session.audioFlushTimer) {
+    clearTimeout(session.audioFlushTimer);
+  }
+
   session.audioFlushTimer = null;
+
   session.audioFlushResolver?.();
   session.audioFlushResolver = null;
-  void session.capture?.stop();
-  if (session.socket?.readyState === WebSocket.OPEN) {
-    session.socket.send(JSON.stringify({ type: "stop" }));
-  }
-  session.socket?.close();
-  session.stream?.getTracks().forEach((track) => track.stop());
+
+  session.audio?.clearPlayback();
+
+  void session.audio?.stop();
+  session.audio = null;
+
+  session.stream
+    ?.getTracks()
+    .forEach((track) => track.stop());
+
+  session.stream = null;
+
+  session.socket?.close(
+    1000,
+    "Client stopped session",
+  );
+
+  session.socket = null;
 }
+
+// function closeSession(session: RealtimeSession) {
+//   if (session.closed) return;
+
+//   session.closed = true;
+
+//   session.readyRejecter?.(
+//     new Error("Session closed"),
+//   );
+
+//   session.readyResolver = null;
+//   session.readyRejecter = null;
+
+//   if (session.extraction.scheduledTimer) {
+//     clearTimeout(session.extraction.scheduledTimer);
+//   }
+
+//   session.extraction.scheduledTimer = null;
+
+//   if (session.extraction.active) {
+//     clearTimeout(session.extraction.active.timer);
+//     session.extraction.active.resolve(false);
+//   }
+
+//   session.extraction.active = null;
+
+//   if (session.audioFlushTimer) {
+//     clearTimeout(session.audioFlushTimer);
+//   }
+
+//   session.audioFlushTimer = null;
+
+//   session.audioFlushResolver?.();
+//   session.audioFlushResolver = null;
+
+//   // Stop agent audio immediately.
+//   session.playback?.clear();
+
+//   // Stop microphone.
+//   void session.capture?.stop();
+//   session.capture = null;
+
+//   // Destroy playback AudioContext.
+//   void session.playback?.close();
+//   session.playback = null;
+
+//   // Stop microphone hardware immediately.
+//   session.stream?.getTracks().forEach(
+//     (track) => track.stop(),
+//   );
+//   session.stream = null;
+
+//   // Closing browser WS is enough:
+//   // Node's socket "close" handler closes Foundry connection.
+//   session.socket?.close(1000, "Client stopped session");
+//   session.socket = null;
+// }
+
 
 function finishAudioFlush(session: RealtimeSession) {
   if (session.audioFlushTimer) clearTimeout(session.audioFlushTimer);
@@ -354,9 +458,10 @@ export function ProfileWorkspace({ config }: { config: ConfigStatus }) {
     const version = ++sessionVersion.current;
     const session: RealtimeSession = {
       socket: null,
-      capture: null,
+      audio: null,
       stream: null,
       closed: false,
+      suppressPlayback: false,
       readyResolver: null,
       readyRejecter: null,
       speechPendingCommit: false,
@@ -399,6 +504,7 @@ export function ProfileWorkspace({ config }: { config: ConfigStatus }) {
 
       setStatus("Connecting to Foundry");
       const socket = new WebSocket("ws://127.0.0.1:8787/voice");
+      socket.binaryType = "arraybuffer";
       session.socket = socket;
       const bridgeReady = new Promise<void>((resolve, reject) => {
         session.readyResolver = resolve;
@@ -414,249 +520,285 @@ export function ProfileWorkspace({ config }: { config: ConfigStatus }) {
       };
       socket.onmessage = (message) => {
         if (session.closed || version !== sessionVersion.current) return;
+
+        // Binary frame = Agent PCM16 24 kHz mono
+        if (message.data instanceof ArrayBuffer) {
+          if (!session.suppressPlayback) {
+            session.audio?.enqueuePlayback(message.data);
+          }
+
+          return;
+        }
+
         try {
           const envelope = JSON.parse(message.data as string) as {
             type?: string;
-                event?: {
-                  type?: string;
-                  response_id?: string;
-                  response?: {
-                    id?: string;
-                    status?: string;
-                    metadata?: Record<string, unknown>;
-                  };
-                  item?: { type?: string; name?: string; arguments?: string; call_id?: string };
-                  item_id?: string;
-                  previous_item_id?: string | null;
-                  transcript?: string;
-                  delta?: string;
-                  error?: { type?: string; code?: string; status?: number; param?: string; event_id?: string; diagnosticHints?: string[] };
-                };
-                error?: { code?: string; message?: string };
-                hadAudio?: boolean;
+            event?: {
+              type?: string;
+              response_id?: string;
+              response?: {
+                id?: string;
+                status?: string;
+                metadata?: Record<string, unknown>;
               };
-
-              if (envelope.type === "bridge.ready") {
-                session.readyResolver?.();
-                session.readyResolver = null;
-                session.readyRejecter = null;
-                return;
-              }
-              if (envelope.type === "bridge.error") {
-                const error = new Error(envelope.error?.message ?? "Foundry voice connection failed.");
-                if (session.readyRejecter) {
-                  session.readyRejecter(error);
-                  session.readyResolver = null;
-                  session.readyRejecter = null;
-                } else {
-                  log(`Foundry bridge error · ${envelope.error?.code ?? "unknown"}`);
-                  endSession(session, version, "Connection failed", "Foundry voice connection became unavailable · session stopped");
-                }
-                return;
-              }
-              if (envelope.type === "bridge.closed") {
-                endSession(session, version, "Connection closed", "Foundry voice connection closed · session stopped");
-                return;
-              }
-              if (envelope.type === "bridge.control" && envelope.hadAudio !== undefined) {
-                if (session.audioFlushResolver && !envelope.hadAudio) finishAudioFlush(session);
-                else if (session.audioFlushResolver) scheduleAudioFlushTimer(session, AUDIO_FLUSH_TIMEOUT_MS, log);
-                return;
-              }
-
-              const event = envelope.type === "event" ? envelope.event : undefined;
-              if (!event) return;
-              const itemId = event.item_id ?? "unknown-item";
-              if (event.type === "input_audio_buffer.speech_started") {
-                session.speechPendingCommit = true;
-              } else if (event.type === "input_audio_buffer.speech_stopped") {
-                log("Speech stopped · waiting for VAD commit");
-              } else if (event.type === "input_audio_buffer.committed" && event.item_id) {
-                const extraction = session.extraction;
-                session.speechPendingCommit = false;
-                extraction.dirty = true;
-                extraction.conversationVersion += 1;
-                if (!extraction.pendingItemIds.includes(event.item_id)) {
-                  extraction.pendingItemIds.push(event.item_id);
-                }
-                extraction.contextItemIds = [
-                  ...extraction.contextItemIds.filter((id) => id !== event.item_id),
-                  event.item_id,
-                ].slice(-MAX_CONTEXT_ITEMS);
-                finishAudioFlush(session);
-                if (!extraction.active && !extraction.scheduledTimer && !extraction.stopping) {
-                  extraction.scheduledTimer = setTimeout(() => {
-                    extraction.scheduledTimer = null;
-                    void requestExtraction(session, false);
-                  }, EXTRACTION_INTERVAL_MS);
-                }
-                setTranscript((current) => current.some((entry) => entry.itemId === itemId)
-                  ? current
-                  : [...current, { itemId, text: "", complete: false }]);
-              } else if (event.type === "conversation.item.input_audio_transcription.delta" && event.delta) {
-                setTranscript((current) => {
-                  const existing = current.find((entry) => entry.itemId === itemId);
-                  if (!existing) return [...current, { itemId, text: event.delta!, complete: false }];
-                  return current.map((entry) => entry.itemId === itemId
-                    ? { ...entry, text: entry.text + event.delta }
-                    : entry);
-                });
-              } else if (event.type === "conversation.item.input_audio_transcription.completed") {
-                setTranscript((current) => {
-                  const existing = current.some((entry) => entry.itemId === itemId);
-                  if (!existing) return [...current, { itemId, text: event.transcript ?? "", complete: true }];
-                  return current.map((entry) => entry.itemId === itemId
-                    ? { ...entry, text: event.transcript ?? entry.text, complete: true }
-                    : entry);
-                });
-              } else if (event.type === "conversation.item.input_audio_transcription.failed") {
-                log("Input transcription failed for an audio segment");
-              } else if (event.type === "response.created" && event.response?.id) {
-                const run = session.extraction.active;
-                if (run && isExtractionResponse(event.response.metadata, run.id)) {
-                  run.responseId = event.response.id;
-                  session.extraction.responseToExtraction.set(event.response.id, run.id);
-                }
-              } else if (event.type === "response.output_item.done" && event.item?.type === "function_call") {
-                const extractionId = event.response_id
-                  ? session.extraction.responseToExtraction.get(event.response_id)
-                  : undefined;
-                const run = session.extraction.active;
-                if (extractionId && run?.id === extractionId) {
-                  run.toolCalled = true;
-                  if (event.item.name !== PROFILE_PATCH_TOOL_NAME || typeof event.item.arguments !== "string") {
-                    log(`Patch rejected · unexpected tool call · ${extractionId.slice(0, 8)}`);
-                  } else {
-                    log(`Function called · ${PROFILE_PATCH_TOOL_NAME} · ${extractionId.slice(0, 8)}`);
-                    run.patchProcessed = handleProfilePatch(session, event.item.arguments);
-                  }
-                  if (event.item.call_id) {
-                    socket.send(JSON.stringify({
-                      type: "tool.output",
-                      callId: event.item.call_id,
-                      output: JSON.stringify({ accepted: run.patchProcessed }),
-                    }));
-                  }
-                }
-              } else if (event.type === "response.done") {
-                const response = event.response;
-                const activeRun = session.extraction.active;
-                const extractionId = (response?.id && session.extraction.responseToExtraction.get(response.id))
-                  || (activeRun && isExtractionResponse(response?.metadata, activeRun.id) ? activeRun.id : undefined);
-                if (extractionId && activeRun?.id === extractionId) {
-                  session.extraction.responseToExtraction.delete(response?.id ?? "");
-                  if (!activeRun.toolCalled) {
-                    log(`Extraction error · ${extractionId.slice(0, 8)} completed without a function call`);
-                  }
-                  completeExtraction(session, response?.status === "completed");
-                }
-              } else if (event.type === "error") {
-                const code = event.error?.code ?? event.error?.status ?? "service error";
-                const eventType = event.error?.type?.replace(/[^a-zA-Z0-9_.-]/g, "").slice(0, 60);
-                const param = event.error?.param?.replace(/[^a-zA-Z0-9_.[\]-]/g, "").slice(0, 80);
-                const hints = event.error?.diagnosticHints?.join(", ");
-                console.error("[Foundry realtime error]", {
-                  code,
-                  type: eventType,
-                  param,
-                  eventId: event.error?.event_id,
-                  hints: event.error?.diagnosticHints,
-                });
-                log(`Foundry realtime error · ${code}${eventType ? ` · ${eventType}` : ""}${param ? ` · ${param}` : ""}${hints ? ` · ${hints}` : ""}`);
-              }
-            } catch {
-              log("Received an unreadable Foundry event");
-            }
+              item?: { type?: string; name?: string; arguments?: string; call_id?: string };
+              item_id?: string;
+              previous_item_id?: string | null;
+              transcript?: string;
+              delta?: string;
+              error?: { type?: string; code?: string; status?: number; param?: string; event_id?: string; diagnosticHints?: string[] };
+            };
+            error?: { code?: string; message?: string };
+            hadAudio?: boolean;
           };
 
-          if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "start" }));
-          const readyTimeout = window.setTimeout(() => {
-            session.readyRejecter?.(new Error("Timed out waiting for the Foundry voice session."));
-          }, 45_000);
-          try {
-            await bridgeReady;
-          } finally {
-            window.clearTimeout(readyTimeout);
-          }
-          if (version !== sessionVersion.current || session.closed) return;
-
-          session.capture = await createPcmCapture(stream, socket, (error) => {
-            log(error.message);
-            endSession(session, version, "Connection lost", "Audio transport stopped · session closed");
-          });
-          if (version !== sessionVersion.current || session.closed) {
-            await session.capture.stop();
+          if (envelope.type === "bridge.ready") {
+            session.readyResolver?.();
+            session.readyResolver = null;
+            session.readyRejecter = null;
             return;
           }
-          setStatus("Connected · listening");
-          setIsListening(true);
-          log("Foundry voice agent connected · microphone is live");
-        } catch (error) {
-          if (version !== sessionVersion.current || session.closed) return;
-          closeSession(session);
-          sessionRef.current = null;
-          setStatus("Connection failed");
-          setIsListening(false);
-          const message = error instanceof Error ? error.message : "An unexpected connection error occurred.";
-          log(message.toLowerCase().includes("permission") || message.toLowerCase().includes("denied")
-            ? "Microphone access was denied"
-            : `Connection error · ${message}`);
-        }
-      }
-
-      async function handleStop() {
-        const session = sessionRef.current;
-        if (!session || session.closed || session.extraction.stopping) return;
-        session.extraction.stopping = true;
-        if (session.extraction.scheduledTimer) clearTimeout(session.extraction.scheduledTimer);
-        session.extraction.scheduledTimer = null;
-        if (session.socket?.readyState !== WebSocket.OPEN) {
-          sessionVersion.current += 1;
-          closeSession(session);
-          sessionRef.current = null;
-          setIsListening(false);
-          setStatus("Not connected");
-          log("Session stopped · microphone and bridge closed");
-          return;
-        }
-        setStatus("Finishing audio · waiting for VAD commit");
-        log("Stop requested · flushing microphone audio");
-        await session.capture?.stop();
-        session.capture = null;
-        session.stream?.getAudioTracks().forEach((track) => { track.enabled = false; });
-        setIsListening(false);
-
-        const flushAudio = new Promise<void>((resolve) => {
-          session.audioFlushResolver = resolve;
-          scheduleAudioFlushTimer(session, AUDIO_FLUSH_TIMEOUT_MS, log);
-          session.socket?.send(JSON.stringify({ type: "audio.finish" }));
-        });
-        await flushAudio;
-        if (session.closed) return;
-        setStatus("Finishing extraction · microphone muted");
-        log("Audio flush complete · extracting committed speech");
-
-        const deadline = Date.now() + EXTRACTION_TIMEOUT_MS * 2 + 1_000;
-        while (!session.closed && Date.now() < deadline) {
-          const active = session.extraction.active;
-          if (active) {
-            await active.promise;
-            continue;
+          if (envelope.type === "bridge.error") {
+            const error = new Error(envelope.error?.message ?? "Foundry voice connection failed.");
+            if (session.readyRejecter) {
+              session.readyRejecter(error);
+              session.readyResolver = null;
+              session.readyRejecter = null;
+            } else {
+              log(`Foundry bridge error · ${envelope.error?.code ?? "unknown"}`);
+              endSession(session, version, "Connection failed", "Foundry voice connection became unavailable · session stopped");
+            }
+            return;
           }
-          if (!session.extraction.dirty) break;
-          await requestExtraction(session, true);
-        }
+          if (envelope.type === "bridge.closed") {
+            endSession(session, version, "Connection closed", "Foundry voice connection closed · session stopped");
+            return;
+          }
+          if (envelope.type === "bridge.control" && envelope.hadAudio !== undefined) {
+            if (session.audioFlushResolver && !envelope.hadAudio) finishAudioFlush(session);
+            else if (session.audioFlushResolver) scheduleAudioFlushTimer(session, AUDIO_FLUSH_TIMEOUT_MS, log);
+            return;
+          }
 
-        if (sessionRef.current === session && !session.closed) {
-          if (session.extraction.dirty) log("Final extraction timed out · closing session");
-          sessionVersion.current += 1;
-          closeSession(session);
-          sessionRef.current = null;
-          setIsListening(false);
-          setStatus("Not connected");
-          log("Session stopped · microphone and Foundry connection closed");
+          const event = envelope.type === "event" ? envelope.event : undefined;
+          if (!event) return;
+          const itemId = event.item_id ?? "unknown-item";
+          if (
+            event.type ===
+            "input_audio_buffer.speech_started"
+          ) {
+            session.speechPendingCommit = true;
+            session.suppressPlayback = true;
+
+            session.audio?.clearPlayback();
+
+            log(
+              "Speech started · agent playback interrupted",
+            );
+          } else if (event.type === "input_audio_buffer.speech_stopped") {
+            log("Speech stopped · waiting for VAD commit");
+          } else if (event.type === "input_audio_buffer.committed" && event.item_id) {
+            const extraction = session.extraction;
+            session.speechPendingCommit = false;
+            extraction.dirty = true;
+            extraction.conversationVersion += 1;
+            if (!extraction.pendingItemIds.includes(event.item_id)) {
+              extraction.pendingItemIds.push(event.item_id);
+            }
+            extraction.contextItemIds = [
+              ...extraction.contextItemIds.filter((id) => id !== event.item_id),
+              event.item_id,
+            ].slice(-MAX_CONTEXT_ITEMS);
+            finishAudioFlush(session);
+            if (!extraction.active && !extraction.scheduledTimer && !extraction.stopping) {
+              extraction.scheduledTimer = setTimeout(() => {
+                extraction.scheduledTimer = null;
+                void requestExtraction(session, false);
+              }, EXTRACTION_INTERVAL_MS);
+            }
+            setTranscript((current) => current.some((entry) => entry.itemId === itemId)
+              ? current
+              : [...current, { itemId, text: "", complete: false }]);
+          } else if (event.type === "conversation.item.input_audio_transcription.delta" && event.delta) {
+            setTranscript((current) => {
+              const existing = current.find((entry) => entry.itemId === itemId);
+              if (!existing) return [...current, { itemId, text: event.delta!, complete: false }];
+              return current.map((entry) => entry.itemId === itemId
+                ? { ...entry, text: entry.text + event.delta }
+                : entry);
+            });
+          } else if (event.type === "conversation.item.input_audio_transcription.completed") {
+            setTranscript((current) => {
+              const existing = current.some((entry) => entry.itemId === itemId);
+              if (!existing) return [...current, { itemId, text: event.transcript ?? "", complete: true }];
+              return current.map((entry) => entry.itemId === itemId
+                ? { ...entry, text: event.transcript ?? entry.text, complete: true }
+                : entry);
+            });
+          } else if (event.type === "conversation.item.input_audio_transcription.failed") {
+            log("Input transcription failed for an audio segment");
+          } else if (event.type === "response.created" && event.response?.id) {
+            session.suppressPlayback = false;
+            const run = session.extraction.active;
+            if (run && isExtractionResponse(event.response.metadata, run.id)) {
+              run.responseId = event.response.id;
+              session.extraction.responseToExtraction.set(event.response.id, run.id);
+            }
+          } else if (event.type === "response.output_item.done" && event.item?.type === "function_call") {
+            const extractionId = event.response_id
+              ? session.extraction.responseToExtraction.get(event.response_id)
+              : undefined;
+            const run = session.extraction.active;
+            if (extractionId && run?.id === extractionId) {
+              run.toolCalled = true;
+              if (event.item.name !== PROFILE_PATCH_TOOL_NAME || typeof event.item.arguments !== "string") {
+                log(`Patch rejected · unexpected tool call · ${extractionId.slice(0, 8)}`);
+              } else {
+                log(`Function called · ${PROFILE_PATCH_TOOL_NAME} · ${extractionId.slice(0, 8)}`);
+                run.patchProcessed = handleProfilePatch(session, event.item.arguments);
+              }
+              if (event.item.call_id) {
+                socket.send(JSON.stringify({
+                  type: "tool.output",
+                  callId: event.item.call_id,
+                  output: JSON.stringify({ accepted: run.patchProcessed }),
+                }));
+              }
+            }
+          } else if (event.type === "response.done") {
+            const response = event.response;
+            const activeRun = session.extraction.active;
+            const extractionId = (response?.id && session.extraction.responseToExtraction.get(response.id))
+              || (activeRun && isExtractionResponse(response?.metadata, activeRun.id) ? activeRun.id : undefined);
+            if (extractionId && activeRun?.id === extractionId) {
+              session.extraction.responseToExtraction.delete(response?.id ?? "");
+              if (!activeRun.toolCalled) {
+                log(`Extraction error · ${extractionId.slice(0, 8)} completed without a function call`);
+              }
+              completeExtraction(session, response?.status === "completed");
+            }
+          } else if (event.type === "error") {
+            const code = event.error?.code ?? event.error?.status ?? "service error";
+            const eventType = event.error?.type?.replace(/[^a-zA-Z0-9_.-]/g, "").slice(0, 60);
+            const param = event.error?.param?.replace(/[^a-zA-Z0-9_.[\]-]/g, "").slice(0, 80);
+            const hints = event.error?.diagnosticHints?.join(", ");
+            console.error("[Foundry realtime error]", {
+              code,
+              type: eventType,
+              param,
+              eventId: event.error?.event_id,
+              hints: event.error?.diagnosticHints,
+            });
+            log(`Foundry realtime error · ${code}${eventType ? ` · ${eventType}` : ""}${param ? ` · ${param}` : ""}${hints ? ` · ${hints}` : ""}`);
+          }
+        } catch {
+          log("Received an unreadable Foundry event");
         }
+      };
+
+      if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "start" }));
+      const readyTimeout = window.setTimeout(() => {
+        session.readyRejecter?.(new Error("Timed out waiting for the Foundry voice session."));
+      }, 45_000);
+      try {
+        await bridgeReady;
+      } finally {
+        window.clearTimeout(readyTimeout);
       }
+      if (version !== sessionVersion.current || session.closed) return;
+
+      session.audio = await createRealtimeAudio(
+        stream,
+        socket,
+        (error) => {
+          log(error.message);
+
+          endSession(
+            session,
+            version,
+            "Connection lost",
+            "Audio transport stopped · session closed",
+          );
+        },
+      );
+      if (
+        version !== sessionVersion.current ||
+        session.closed
+      ) {
+        await session.audio.stop();
+        session.audio = null;
+        return;
+      }
+      setStatus("Connected · listening");
+      setIsListening(true);
+      log("Foundry voice agent connected · microphone is live");
+    } catch (error) {
+      if (version !== sessionVersion.current || session.closed) return;
+      closeSession(session);
+      sessionRef.current = null;
+      setStatus("Connection failed");
+      setIsListening(false);
+      const message = error instanceof Error ? error.message : "An unexpected connection error occurred.";
+      log(message.toLowerCase().includes("permission") || message.toLowerCase().includes("denied")
+        ? "Microphone access was denied"
+        : `Connection error · ${message}`);
+    }
+  }
+
+  async function handleStop() {
+    const session = sessionRef.current;
+
+    if (!session || session.closed) {
+      return;
+    }
+
+    log("Stop requested · closing session");
+
+    sessionVersion.current += 1;
+
+    session.audio?.clearPlayback();
+
+    closeSession(session);
+
+    sessionRef.current = null;
+
+    setIsListening(false);
+    setStatus("Not connected");
+
+    log(
+      "Session stopped · microphone, playback and Foundry connection closed",
+    );
+  }
+
+  // async function handleStop() {
+  //   const session = sessionRef.current;
+
+  //   if (!session || session.closed) return;
+
+  //   log("Stop requested · closing session");
+
+  //   // Invalidate all async callbacks from this session immediately.
+  //   sessionVersion.current += 1;
+
+  //   // Stop browser audio immediately.
+  //   session.playback?.clear();
+
+  //   // closeSession handles:
+  //   // - microphone capture
+  //   // - playback AudioContext
+  //   // - bridge "stop"
+  //   // - browser WebSocket
+  //   // - MediaStream tracks
+  //   closeSession(session);
+
+  //   sessionRef.current = null;
+
+  //   setIsListening(false);
+  //   setStatus("Not connected");
+
+  //   log("Session stopped · microphone, playback and Foundry connection closed");
+  // }
+
 
   return (
     <main className="shell">
