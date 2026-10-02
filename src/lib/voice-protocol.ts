@@ -4,6 +4,7 @@ export type FoundryVoiceEvent = {
   previous_item_id?: string | null;
   delta?: string;
   transcript?: string;
+  text?: string;
   response?: {
     id?: string;
     status?: string;
@@ -55,10 +56,13 @@ export function normalizeFoundryVoiceEvent(event: FoundryVoiceEvent) {
       return { type: event.type, item_id: event.item_id, transcript: event.transcript };
     case "conversation.item.input_audio_transcription.failed":
       return { type: event.type, item_id: event.item_id };
+    case "response.text.done":
+      return { type: event.type, response_id: event.response_id, text: event.text };
     case "response.created":
     case "response.done":
       return {
         type: event.type,
+        response_id: event.response_id,
         response: event.response && {
           id: event.response.id,
           status: event.response.status,

@@ -20,6 +20,10 @@ const FEATURE_OPTIONS = {
 };
 const PCM_BYTES_PER_SAMPLE = 2;
 
+function logTime() {
+  return new Date().toISOString();
+}
+
 function safeErrorCode(error) {
   if (
     error?.name === "AggregateAuthenticationError" &&
@@ -153,7 +157,6 @@ function createSessionHandler(socket) {
 
       eventPump = (async () => {
         for await (const event of connection) {
-          console.log("[foundry]", event.type);
 
           if (event.type === "session.created") {
             console.log("[bridge] session.created");
@@ -179,6 +182,7 @@ function createSessionHandler(socket) {
             case "conversation.item.input_audio_transcription.delta":
             case "conversation.item.input_audio_transcription.completed":
             case "conversation.item.input_audio_transcription.failed":
+              console.log(`[${logTime()}] [foundry] ${event.type}`);
               console.dir(event, { depth: null });
               break;
           }
@@ -368,8 +372,8 @@ function createSessionHandler(socket) {
     commandQueue = commandQueue
       .then(() => handleMessage(data, isBinary))
       .catch((error) => {
-        console.error("[bridge] COMMAND ERROR:", error);
-        console.error("[bridge] COMMAND ERROR stack:", error?.stack);
+        console.error(`[${logTime()}] [bridge] COMMAND ERROR:`, error);
+        console.error(`[${logTime()}] [bridge] COMMAND ERROR stack:`, error?.stack);
 
         sendFailure(
           socket,

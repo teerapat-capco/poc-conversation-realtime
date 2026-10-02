@@ -1,38 +1,38 @@
 export const MAX_EXTRACTION_ATTEMPTS = 3;
 export const MAX_CONTEXT_ITEMS = 6;
 
-type RealtimeInputItem =
-  | { type: "item_reference"; id: string }
-  | { type: "message"; role: "user"; content: [{ type: "input_text"; text: string }] };
+export type ExtractionTranscriptItem = {
+  itemId: string;
+  transcript: string;
+};
 
-export function buildExtractionInput(contextItemIds: string[], newItemIds: string[]) {
-  const newIds = new Set(newItemIds);
-  const contextIds = [...new Set(contextItemIds)]
-    .filter((itemId) => !newIds.has(itemId))
+type RealtimeInputItem = {
+  type: "message";
+  role: "user";
+  content: [{ type: "input_text"; text: string }];
+};
+
+export function buildExtractionInput(
+  contextItems: ExtractionTranscriptItem[],
+  newItems: ExtractionTranscriptItem[],
+) {
+  const newIds = new Set(newItems.map((item) => item.itemId));
+  const context = contextItems
+    .filter((item) => !newIds.has(item.itemId))
+    .filter((item, index, items) => items.findIndex((candidate) => candidate.itemId === item.itemId) === index)
     .slice(-MAX_CONTEXT_ITEMS);
-  const input: RealtimeInputItem[] = [];
-
-  if (contextIds.length > 0) {
-    input.push({
-      type: "message",
-      role: "user",
-      content: [{
-        type: "input_text",
-        text: `Earlier conversation audio is context only. Use it to resolve short replies, but do not extract facts from it. Context item IDs: ${contextIds.join(", ")}`,
-      }],
-    });
-    input.push(...contextIds.map((id) => ({ type: "item_reference" as const, id })));
-  }
-
-  input.push({
+  const contextIds = context.map((item) => item.itemId);
+  const input: RealtimeInputItem[] = [{
     type: "message",
     role: "user",
     content: [{
       type: "input_text",
-      text: `New committed audio to process. Only these items can provide new or corrected facts: ${newItemIds.join(", ")}`,
+      text: JSON.stringify({
+        context,
+        newEvidence: newItems,
+      }),
     }],
-  });
-  input.push(...newItemIds.map((id) => ({ type: "item_reference" as const, id })));
+  }];
 
   return { contextIds, input };
 }

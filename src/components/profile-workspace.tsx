@@ -21,6 +21,7 @@ import {
   MAX_EXTRACTION_ATTEMPTS,
   MAX_CONTEXT_ITEMS,
   settleExtractionItems,
+  type ExtractionTranscriptItem,
 } from "@/lib/extraction";
 // import {
 //   createPcmPlayback,
@@ -40,6 +41,7 @@ type ExtractionRun = {
   itemIds: string[];
   responseId: string | null;
   toolCalled: boolean;
+  transcriptTest: boolean;
   patchProcessed: boolean;
   timer: ReturnType<typeof setTimeout>;
   promise: Promise<boolean>;
@@ -53,6 +55,7 @@ type ExtractionState = {
   scheduledTimer: ReturnType<typeof setTimeout> | null;
   responseToExtraction: Map<string, string>;
   pendingItemIds: string[];
+  evidenceByItemId: Map<string, ExtractionTranscriptItem>;
   contextItemIds: string[];
   retryCounts: Map<string, number>;
   manualFields: Set<ProfileField>;
@@ -64,6 +67,8 @@ type RealtimeSession = {
   stream: MediaStream | null;
   closed: boolean;
   suppressPlayback: boolean;
+  normalResponseActive: boolean;
+  extractionQueuedForNormalResponse: boolean;
   readyResolver: (() => void) | null;
   readyRejecter: ((error: Error) => void) | null;
   extraction: ExtractionState;
@@ -73,7 +78,7 @@ type RealtimeSession = {
 };
 
 const MAX_LOG_ENTRIES = 30;
-const EXTRACTION_INTERVAL_MS = 10_000;
+const EXTRACTION_INTERVAL_MS = 3_000;
 const EXTRACTION_TIMEOUT_MS = 15_000;
 const AUDIO_FLUSH_TIMEOUT_MS = 5_000;
 
@@ -311,7 +316,7 @@ export function ProfileWorkspace({ config }: { config: ConfigStatus }) {
     if (!run) return;
     clearTimeout(run.timer);
     if (extraction.conversationVersion !== run.conversationVersion) extraction.dirty = true;
-    const succeeded = responseCompleted && run.toolCalled && run.patchProcessed;
+    const succeeded = responseCompleted && (run.transcriptTest || (run.toolCalled && run.patchProcessed));
     const settled = settleExtractionItems(
       extraction.pendingItemIds,
       extraction.retryCounts,
@@ -342,6 +347,11 @@ export function ProfileWorkspace({ config }: { config: ConfigStatus }) {
     if (session.closed || session.socket?.readyState !== WebSocket.OPEN) return Promise.resolve(false);
     if (extraction.active) return extraction.active.promise;
     if (!extraction.dirty) return Promise.resolve(true);
+    if (session.normalResponseActive) {
+      session.extractionQueuedForNormalResponse = true;
+      return Promise.resolve(false);
+    }
+    session.extractionQueuedForNormalResponse = false;
     if (extraction.scheduledTimer) {
       clearTimeout(extraction.scheduledTimer);
       extraction.scheduledTimer = null;
@@ -350,8 +360,17 @@ export function ProfileWorkspace({ config }: { config: ConfigStatus }) {
     const id = crypto.randomUUID();
     const conversationVersion = extraction.conversationVersion;
     const itemIds = [...extraction.pendingItemIds];
-    const { contextIds, input } = buildExtractionInput(extraction.contextItemIds, itemIds);
-    const profileContext = JSON.stringify(profileRef.current);
+    const newItems = itemIds
+      .map((itemId) => extraction.evidenceByItemId.get(itemId))
+      .filter((item): item is ExtractionTranscriptItem => Boolean(item));
+    if (newItems.length === 0) {
+      extraction.dirty = false;
+      return Promise.resolve(true);
+    }
+    const contextItems = extraction.contextItemIds
+      .map((itemId) => extraction.evidenceByItemId.get(itemId))
+      .filter((item): item is ExtractionTranscriptItem => Boolean(item));
+    const { input } = buildExtractionInput(contextItems, newItems);
     let resolveRun!: (succeeded: boolean) => void;
     const promise = new Promise<boolean>((resolve) => { resolveRun = resolve; });
     const timer = setTimeout(() => {
@@ -365,6 +384,7 @@ export function ProfileWorkspace({ config }: { config: ConfigStatus }) {
       itemIds,
       responseId: null,
       toolCalled: false,
+      transcriptTest: false,
       patchProcessed: false,
       timer,
       promise,
@@ -374,13 +394,22 @@ export function ProfileWorkspace({ config }: { config: ConfigStatus }) {
     log(`${final ? "Final e" : "E"}xtraction requested · ${id.slice(0, 8)}`);
 
     try {
+      const sourceItemId = newItems[newItems.length - 1]?.itemId;
       session.socket.send(JSON.stringify({
         type: "response.create",
         response: {
           conversation: "none",
           output_modalities: ["text"],
-          metadata: { purpose: "customer_profile_extraction", extractionId: id },
-          instructions: `${extractionInstructions}\n\nUse earlier conversation item references only to resolve the meaning of short replies. Extract or correct facts only from the explicitly marked new committed audio items. Treat the current profile as a baseline, not evidence: do not repeat unchanged values, and use "correct" only when the new audio clearly corrects a baseline value.\nContext item IDs: ${contextIds.join(", ") || "none"}. New item IDs: ${itemIds.join(", ")}.\n\nCurrent profile state: ${profileContext}`,
+          metadata: {
+            purpose: "customer_profile_extraction",
+            extractionId: id,
+            sourceItemId,
+          },
+          instructions: `${extractionInstructions}
+
+Use context transcript items only to resolve the meaning of short replies. Extract or correct facts only from newEvidence. Treat the current profile as a baseline, not evidence: do not repeat unchanged values, and use "correct" only when newEvidence clearly corrects a baseline value.
+
+Current profile state: ${JSON.stringify(profileRef.current)}`,
           input,
           tools: [profilePatchTool],
           tool_choice: "required",
@@ -462,6 +491,8 @@ export function ProfileWorkspace({ config }: { config: ConfigStatus }) {
       stream: null,
       closed: false,
       suppressPlayback: false,
+      normalResponseActive: false,
+      extractionQueuedForNormalResponse: false,
       readyResolver: null,
       readyRejecter: null,
       speechPendingCommit: false,
@@ -475,6 +506,7 @@ export function ProfileWorkspace({ config }: { config: ConfigStatus }) {
         scheduledTimer: null,
         responseToExtraction: new Map(),
         pendingItemIds: [],
+        evidenceByItemId: new Map(),
         contextItemIds: [],
         retryCounts: new Map(),
         manualFields: new Set(),
@@ -545,6 +577,7 @@ export function ProfileWorkspace({ config }: { config: ConfigStatus }) {
               item_id?: string;
               previous_item_id?: string | null;
               transcript?: string;
+              text?: string;
               delta?: string;
               error?: { type?: string; code?: string; status?: number; param?: string; event_id?: string; diagnosticHints?: string[] };
             };
@@ -600,22 +633,7 @@ export function ProfileWorkspace({ config }: { config: ConfigStatus }) {
           } else if (event.type === "input_audio_buffer.committed" && event.item_id) {
             const extraction = session.extraction;
             session.speechPendingCommit = false;
-            extraction.dirty = true;
-            extraction.conversationVersion += 1;
-            if (!extraction.pendingItemIds.includes(event.item_id)) {
-              extraction.pendingItemIds.push(event.item_id);
-            }
-            extraction.contextItemIds = [
-              ...extraction.contextItemIds.filter((id) => id !== event.item_id),
-              event.item_id,
-            ].slice(-MAX_CONTEXT_ITEMS);
             finishAudioFlush(session);
-            if (!extraction.active && !extraction.scheduledTimer && !extraction.stopping) {
-              extraction.scheduledTimer = setTimeout(() => {
-                extraction.scheduledTimer = null;
-                void requestExtraction(session, false);
-              }, EXTRACTION_INTERVAL_MS);
-            }
             setTranscript((current) => current.some((entry) => entry.itemId === itemId)
               ? current
               : [...current, { itemId, text: "", complete: false }]);
@@ -628,6 +646,23 @@ export function ProfileWorkspace({ config }: { config: ConfigStatus }) {
                 : entry);
             });
           } else if (event.type === "conversation.item.input_audio_transcription.completed") {
+            if (event.item_id && typeof event.transcript === "string") {
+              const extraction = session.extraction;
+              extraction.evidenceByItemId.set(event.item_id, { itemId: event.item_id, transcript: event.transcript });
+              extraction.conversationVersion += 1;
+              if (!extraction.pendingItemIds.includes(event.item_id)) extraction.pendingItemIds.push(event.item_id);
+              extraction.contextItemIds = [
+                ...extraction.contextItemIds.filter((id) => id !== event.item_id),
+                event.item_id,
+              ].slice(-MAX_CONTEXT_ITEMS);
+              extraction.dirty = true;
+              if (!extraction.active && !extraction.scheduledTimer && !extraction.stopping) {
+                extraction.scheduledTimer = setTimeout(() => {
+                  extraction.scheduledTimer = null;
+                  void requestExtraction(session, false);
+                }, EXTRACTION_INTERVAL_MS);
+              }
+            }
             setTranscript((current) => {
               const existing = current.some((entry) => entry.itemId === itemId);
               if (!existing) return [...current, { itemId, text: event.transcript ?? "", complete: true }];
@@ -638,17 +673,32 @@ export function ProfileWorkspace({ config }: { config: ConfigStatus }) {
           } else if (event.type === "conversation.item.input_audio_transcription.failed") {
             log("Input transcription failed for an audio segment");
           } else if (event.type === "response.created" && event.response?.id) {
-            session.suppressPlayback = false;
             const run = session.extraction.active;
-            if (run && isExtractionResponse(event.response.metadata, run.id)) {
+            const metadataMatches = run && isExtractionResponse(event.response.metadata, run.id);
+            const canClaimActiveExtraction = Boolean(
+              run
+              && !run.responseId
+              && !session.extraction.responseToExtraction.has(event.response.id),
+            );
+
+            if (run && (metadataMatches || canClaimActiveExtraction)) {
               run.responseId = event.response.id;
               session.extraction.responseToExtraction.set(event.response.id, run.id);
+              log(`Extraction response mapped · ${run.id.slice(0, 8)} · ${event.response.id.slice(0, 8)}`);
+            } else {
+              session.normalResponseActive = true;
+              session.suppressPlayback = false;
             }
-          } else if (event.type === "response.output_item.done" && event.item?.type === "function_call") {
+          } else if (event.type === "response.text.done" && typeof event.text === "string") {
             const extractionId = event.response_id
               ? session.extraction.responseToExtraction.get(event.response_id)
               : undefined;
+            if (extractionId) log(`Transcript OOB result · ${event.text}`);
+          } else if (event.type === "response.output_item.done" && event.item?.type === "function_call") {
             const run = session.extraction.active;
+            const extractionId = event.response_id
+              ? session.extraction.responseToExtraction.get(event.response_id)
+              : (run?.responseId ? session.extraction.responseToExtraction.get(run.responseId) : undefined);
             if (extractionId && run?.id === extractionId) {
               run.toolCalled = true;
               if (event.item.name !== PROFILE_PATCH_TOOL_NAME || typeof event.item.arguments !== "string") {
@@ -657,25 +707,44 @@ export function ProfileWorkspace({ config }: { config: ConfigStatus }) {
                 log(`Function called · ${PROFILE_PATCH_TOOL_NAME} · ${extractionId.slice(0, 8)}`);
                 run.patchProcessed = handleProfilePatch(session, event.item.arguments);
               }
-              if (event.item.call_id) {
-                socket.send(JSON.stringify({
-                  type: "tool.output",
-                  callId: event.item.call_id,
-                  output: JSON.stringify({ accepted: run.patchProcessed }),
-                }));
-              }
+              // OOB extraction uses the function call as its final structured result.
+              // Do not send tool output back to Foundry.
+              // if (event.item.call_id) {
+              //   socket.send(JSON.stringify({
+              //     type: "tool.output",
+              //     callId: event.item.call_id,
+              //     output: JSON.stringify({ accepted: run.patchProcessed }),
+              //   }));
+              // }
             }
           } else if (event.type === "response.done") {
             const response = event.response;
             const activeRun = session.extraction.active;
             const extractionId = (response?.id && session.extraction.responseToExtraction.get(response.id))
               || (activeRun && isExtractionResponse(response?.metadata, activeRun.id) ? activeRun.id : undefined);
+
             if (extractionId && activeRun?.id === extractionId) {
               session.extraction.responseToExtraction.delete(response?.id ?? "");
-              if (!activeRun.toolCalled) {
+              if (!activeRun.transcriptTest && !activeRun.toolCalled) {
                 log(`Extraction error · ${extractionId.slice(0, 8)} completed without a function call`);
               }
               completeExtraction(session, response?.status === "completed");
+            } else {
+              session.normalResponseActive = false;
+              if (
+                session.extractionQueuedForNormalResponse
+                && session.extraction.dirty
+                && !session.extraction.active
+                && !session.extraction.stopping
+                && !session.closed
+              ) {
+                session.extractionQueuedForNormalResponse = false;
+                if (session.extraction.scheduledTimer) {
+                  clearTimeout(session.extraction.scheduledTimer);
+                  session.extraction.scheduledTimer = null;
+                }
+                void requestExtraction(session, false);
+              }
             }
           } else if (event.type === "error") {
             const code = event.error?.code ?? event.error?.status ?? "service error";
